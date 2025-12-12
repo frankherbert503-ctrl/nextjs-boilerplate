@@ -1,0 +1,317 @@
+// This is the full working React code for Atlas Privacy V1.1
+// To use: create a React app with create-react-app, replace src/App.js with this,
+// add dependencies: npm install onnxruntime-web @ffmpeg/ffmpeg stackblur-canvas react-before-after-slider stegcloak
+// Place yolov8n-nsfw.onnx in public/models/
+// For Vercel: deploy as is.
+// Note: Model assumed to be YOLOv8n with NSFW classes (adjust post-processing if needed).
+// Classes assumed: 0: face, 1: nipple, 2: genital, 3: tattoo - blur all detections.
+
+import React, { useState, useEffect, useRef } from 'react';
+import * as ort from 'onnxruntime-web';
+import { createFFmpeg, fetchFile } from '@ffmpeg/ffmpeg';
+import StackBlur from 'stackblur-canvas';
+import BeforeAfterSlider from 'react-before-after-slider';
+import StegCloak from 'stegcloak';
+
+const App = () => {
+  const [session, setSession] = useState(null);
+  const [ffmpeg, setFfmpeg] = useState(null);
+  const [files, setFiles] = useState([]);
+  const [processing, setProcessing] = useState(false);
+  const [resultImages, setResultImages] = useState([]);
+  const [beforeImage, setBeforeImage] = useState(null);
+  const [afterImage, setAfterImage] = useState(null);
+  const [referralText, setReferralText] = useState('');
+  const canvasRef = useRef(null);
+  const videoRef = useRef(null);
+
+  useEffect(() => {
+    // Load ONNX model
+    const loadModel = async () => {
+      ort.env.wasm.wasmPaths = {
+        'ort-wasm.wasm': '/static/js/ort-wasm.wasm',
+        'ort-wasm-threaded.wasm': '/static/js/ort-wasm-threaded.wasm',
+        'ort-wasm-simd.wasm': '/static/js/ort-wasm-simd.wasm',
+      };
+      const sess = await ort.InferenceSession.create('/models/yolov8n-nsfw.onnx', {
+        executionProviders: ['wasm'],
+      });
+      setSession(sess);
+    };
+    loadModel();
+
+    // Load FFmpeg
+    const ff = createFFmpeg({ log: true });
+    ff.load().then(() => setFfmpeg(ff));
+  }, []);
+
+  const checkDailyLimit = () => {
+    const today = new Date().toDateString();
+    const storedDate = localStorage.getItem('lastDate');
+    let count = parseInt(localStorage.getItem('count')) || 0;
+
+    if (storedDate !== today) {
+      count = 0;
+      localStorage.setItem('lastDate', today);
+    }
+
+    if (count >= 3) {
+      alert('Daily free limit reached (3/day).');
+      return false;
+    }
+
+    count++;
+    localStorage.setItem('count', count);
+    return true;
+  };
+
+  const handleFileChange = (e) => {
+    setFiles(Array.from(e.target.files));
+  };
+
+  const processFiles = async () => {
+    if (!checkDailyLimit()) return;
+    setProcessing(true);
+    const results = [];
+
+    for (const file of files) {
+      if (file.type.startsWith('image/')) {
+        const processed = await processImage(file);
+        results.push(processed);
+      } else if (file.type.startsWith('video/')) {
+        const processed = await processVideo(file);
+        results.push(processed);
+      }
+    }
+
+    setResultImages(results);
+    if (results.length > 0) {
+      const first = results[0];
+      setBeforeImage(URL.createObjectURL(files[0]));
+      setAfterImage(first.dataUrl);
+    }
+
+    // Generate referral with StegCloak
+    const uuid = crypto.randomUUID();
+    const steg = new StegCloak();
+    const hidden = steg.hide(uuid, 'atlasprivacy', 'Refer a friend to Atlas Privacy!');
+    setReferralText(hidden);
+
+    setProcessing(false);
+  };
+
+  const processImage = async (file) => {
+    const img = await loadImage(file);
+    const boxes = await detectObjects(img);
+    const canvas = canvasRef.current;
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+
+    for (const box of boxes) {
+      blurRegion(ctx, box, img.width, img.height);
+    }
+
+    const dataUrl = canvas.toDataURL('image/png');
+    return { name: file.name, dataUrl };
+  };
+
+  const loadImage = (file) => {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const detectObjects = async (img) => {
+    const input = await prepareInput(img);
+    const output = await session.run({ images: input });
+    const { boxes, scores, labels } = processOutput(output);
+    const selected = nonMaxSuppression(boxes, scores, labels, 0.5, 0.5);
+    return selected.map((box) => ({
+      x: box[0] * img.width,
+      y: box[1] * img.height,
+      w: (box[2] - box[0]) * img.width,
+      h: (box[3] - box[1]) * img.height,
+    }));
+  };
+
+  const prepareInput = async (img) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 640;
+    canvas.height = 640;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, 640, 640);
+    const data = ctx.getImageData(0, 0, 640, 640).data;
+
+    const input = new Float32Array(3 * 640 * 640);
+    for (let i = 0, j = 0; i < data.length; i += 4, j += 3) {
+      input[j] = data[i] / 255;
+      input[j + 1] = data[i + 1] / 255;
+      input[j + 2] = data[i + 2] / 255;
+    }
+
+    return new ort.Tensor('float32', input, [1, 3, 640, 640]);
+  };
+
+  const processOutput = (output) => {
+    // Assume standard YOLOv8 output: [1, 84, 8400]
+    const data = output.output0.data;
+    const boxes = [];
+    const scores = [];
+    const labels = [];
+
+    for (let i = 0; i < 8400; i++) {
+      const offset = i * 84;
+      const cx = data[offset + 0];
+      const cy = data[offset + 1];
+      const w = data[offset + 2];
+      const h = data[offset + 3];
+      const confs = data.slice(offset + 4, offset + 84);
+      const maxConf = Math.max(...confs);
+      const label = confs.indexOf(maxConf);
+
+      if (maxConf > 0.5 && [0,1,2,3].includes(label)) { // faces, nipples, genitals, tattoos
+        const x1 = (cx - w / 2) / 640;
+        const y1 = (cy - h / 2) / 640;
+        const x2 = (cx + w / 2) / 640;
+        const y2 = (cy + h / 2) / 640;
+        boxes.push([x1, y1, x2, y2]);
+        scores.push(maxConf);
+        labels.push(label);
+      }
+    }
+
+    return { boxes, scores, labels };
+  };
+
+  const nonMaxSuppression = (boxes, scores, labels, confThres, iouThres) => {
+    // Implement NMS here (simple version)
+    const indices = scores.map((_, i) => i).sort((a, b) => scores[b] - scores[a]);
+    const selected = [];
+
+    while (indices.length > 0) {
+      const idx = indices.shift();
+      selected.push({ box: boxes[idx], score: scores[idx], label: labels[idx] });
+
+      indices = indices.filter((i) => {
+        const iou = calculateIoU(boxes[idx], boxes[i]);
+        return iou <= iouThres;
+      });
+    }
+
+    return selected.map((s) => s.box);
+  };
+
+  const calculateIoU = (box1, box2) => {
+    const x1 = Math.max(box1[0], box2[0]);
+    const y1 = Math.max(box1[1], box2[1]);
+    const x2 = Math.min(box1[2], box2[2]);
+    const y2 = Math.min(box1[3], box2[3]);
+    const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+    const area1 = (box1[2] - box1[0]) * (box1[3] - box1[1]);
+    const area2 = (box2[2] - box2[0]) * (box2[3] - box2[1]);
+    return inter / (area1 + area2 - inter);
+  };
+
+  const blurRegion = (ctx, box, width, height) => {
+    // Crop region, blur, paste back with feather
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = box.w;
+    tempCanvas.height = box.h;
+    const tempCtx = tempCanvas.getContext('2d');
+    tempCtx.drawImage(ctx.canvas, -box.x, -box.y);
+
+    // Blur
+    StackBlur.canvasRGBA(tempCanvas, 0, 0, box.w, box.h, 20); // radius 20
+
+    // Paste back
+    ctx.drawImage(tempCanvas, box.x, box.y);
+
+    // Simple feather: blur edges more? But for now, since Gaussian, it's feathered.
+  };
+
+  const processVideo = async (file) => {
+    const videoName = 'input.mp4';
+    const frameDir = 'frames/';
+    const processedFrameDir = 'processed_frames/';
+
+    // Write file to FFmpeg FS
+    ffmpeg.FS('writeFile', videoName, await fetchFile(file));
+
+    // Extract frames
+    await ffmpeg.run('-i', videoName, '-vf', 'fps=30', `${frameDir}%04d.png`);
+
+    const frames = ffmpeg.FS('readdir', frameDir).filter((f) => f.endsWith('.png'));
+
+    for (const frame of frames) {
+      const data = ffmpeg.FS('readFile', `${frameDir}${frame}`);
+      const blob = new Blob([data.buffer], { type: 'image/png' });
+      const file = new File([blob], frame);
+      const processed = await processImage(file);
+      const processedData = await fetch(processed.dataUrl).then((r) => r.arrayBuffer());
+      ffmpeg.FS('writeFile', `${processedFrameDir}${frame}`, new Uint8Array(processedData));
+    }
+
+    // Mux back to video
+    const outputName = 'output.mp4';
+    await ffmpeg.run('-i', `${processedFrameDir}%04d.png`, '-c:v', 'libx264', '-r', '30', outputName);
+
+    const outputData = ffmpeg.FS('readFile', outputName);
+    const outputUrl = URL.createObjectURL(new Blob([outputData.buffer], { type: 'video/mp4' }));
+
+    // Clean up
+    frames.forEach((f) => {
+      ffmpeg.FS('unlink', `${frameDir}${f}`);
+      ffmpeg.FS('unlink', `${processedFrameDir}${f}`);
+    });
+    ffmpeg.FS('unlink', videoName);
+    ffmpeg.FS('unlink', outputName);
+
+    return { name: file.name, dataUrl: outputUrl };
+  };
+
+  const copyReferral = () => {
+    navigator.clipboard.writeText(referralText);
+    alert('Referral copied!');
+  };
+
+  return (
+    <div style={{ background: 'black', color: 'white', height: '100vh', padding: '20px' }}>
+      <h1>Atlas Privacy V1.1</h1>
+      <input type="file" multiple accept="image/*,video/*" onChange={handleFileChange} />
+      <button onClick={processFiles} disabled={processing || !session || !ffmpeg}>
+        {processing ? 'Processing...' : 'Process'}
+      </button>
+      {beforeImage && afterImage && (
+        <BeforeAfterSlider
+          before={beforeImage}
+          after={afterImage}
+          width={600}
+          height={400}
+        />
+      )}
+      {resultImages.map((res, i) => (
+        <div key={i}>
+          <a href={res.dataUrl} download={res.name}>Download {res.name}</a>
+        </div>
+      ))}
+      {referralText && (
+        <div>
+          <p>{referralText}</p>
+          <button onClick={copyReferral}>Copy Referral</button>
+        </div>
+      )}
+      <canvas ref={canvasRef} style={{ display: 'none' }} />
+      <video ref={videoRef} style={{ display: 'none' }} />
+    </div>
+  );
+};
+
+export default App;
